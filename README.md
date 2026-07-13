@@ -29,8 +29,7 @@ knowledge** baked in. HackerOne's public GraphQL endpoint crashes on several
 otherwise-natural query shapes (substate filter + sort + report fields;
 `disclosed_at` + substate; named variables + substate + report fields). `h1grep`
 encodes empirically-discovered crash-avoidance rules so that searching disclosed
-reports from the terminal *just works* — something no other packaged CLI does.
-
+reports from the terminal *just works*.
 Studying disclosed reports is one of the highest-signal ways to learn validated
 techniques: what got voted up by the community, what paid out, and how impact was
 framed for a specific program.
