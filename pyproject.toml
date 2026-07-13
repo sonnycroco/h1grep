@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "h1grep"
-version = "0.1.0"
+dynamic = ["version"]
 description = "grep disclosed HackerOne reports for recon and research"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -46,3 +46,6 @@ h1grep = "h1grep:main"
 
 [tool.setuptools]
 py-modules = ["h1grep"]
+
+[tool.setuptools.dynamic]
+version = { attr = "h1grep.__version__" }

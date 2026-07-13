@@ -49,6 +49,8 @@ import urllib.request
 import urllib.error
 from typing import NoReturn, Optional
 
+__version__ = "0.1.0"
+
 GRAPHQL_URL = "https://hackerone.com/graphql"
 ISSUES_URL = "https://github.com/sonnycroco/h1grep/issues"
 HEADERS = {
@@ -351,6 +353,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--query", "-q", help="Keyword regex to match in report titles (client-side)")
     parser.add_argument(
         "--severity", "-s",
