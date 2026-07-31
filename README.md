@@ -12,24 +12,28 @@ $ h1grep --top-voted --limit 3
 
 ========================================================================
  h1grep — top voted
- 50 matches from 50 fetched reports
+ showing 3 of 50 matches from 50 fetched reports — raise with --limit/-n
 ========================================================================
 
 [01] Takeover an account that doesn't have a Shopify ID and more
      Severity : CRITICAL  |  CWE: n/a
      Program  : shopify  |  Reporter: imgnotfound
-     Bounty   : no bounty  |  Votes: 2990
+     Bounty   : no bounty  |  Votes: 2993
      URL      : https://hackerone.com/reports/867513
 ```
 
 ## Why
 
 It isn't "another recon script." The value is the **reverse-engineered GraphQL
-knowledge** baked in. HackerOne's public GraphQL endpoint crashes on several
-otherwise-natural query shapes (substate filter + sort + report fields;
-`disclosed_at` + substate; named variables + substate + report fields). `h1grep`
-encodes empirically-discovered crash-avoidance rules so that searching disclosed
-reports from the terminal *just works*.
+knowledge** baked in. HackerOne's Hacktivity endpoint is public but undocumented,
+and it moves. For a long stretch it hard-crashed on several otherwise-natural
+query shapes (substate filter + sort + report fields; `disclosed_at` + substate;
+named variables + substate + report fields), so `h1grep` encodes empirical
+crash-avoidance rules. More recently it tightened `team_id` to a strict `[Int!]`,
+which silently breaks any client still quoting the value. Tracking that drift is
+the work — it's why searching disclosed reports from the terminal *just works*
+here.
+
 Studying disclosed reports is one of the highest-signal ways to learn validated
 techniques: what got voted up by the community, what paid out, and how impact was
 framed for a specific program.
@@ -106,11 +110,14 @@ so widen `--pages` when you filter aggressively.
    around the endpoint's crash triggers. Pure sort (no program) uses server-side
    sorting; program filtering uses a substate/team filter with no server-side
    sort, then sorts client-side.
-2. **Pagination** — walks pages of 50 using base64 offset cursors, sleeping
-   0.3s between pages (polite rate limiting), up to `--pages`.
+2. **Pagination** — walks pages of 50, following the server-supplied
+   `pageInfo.endCursor` and sleeping 0.3s between pages (polite rate limiting),
+   up to `--pages`.
 3. **Client-side filter & sort** — keyword/severity/CWE and the fallback sort
    are applied locally.
-4. **Output** — color-coded text by default, or `--json`.
+4. **Output** — color-coded text by default, or `--json`. The header reports how
+   many matches were shown versus found, and how many fetched rows were dropped
+   for being undisclosed.
 
 ## Caveats
 
@@ -122,6 +129,10 @@ so widen `--pages` when you filter aggressively.
   if you hit it.
 - **Disclosed reports only.** It can only see what HackerOne has publicly
   disclosed — never private program data.
+- **`--top-bounty` has a low yield per page.** The highest-paying entries are
+  mostly still undisclosed: they carry a bounty amount but no public report, so
+  they get dropped. Typically only ~5 of 50 fetched rows survive on the first
+  page. The header tells you how many were dropped — widen `--pages`.
 - **Read-only and rate-limited by design.** It fetches and prints; it does not
   write, submit, or scrape aggressively. Please keep it that way and be a good
   citizen of the endpoint.

@@ -40,7 +40,6 @@ Usage examples:
 """
 
 import argparse
-import base64
 import json
 import sys
 import re
@@ -49,7 +48,7 @@ import urllib.request
 import urllib.error
 from typing import NoReturn, Optional
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 GRAPHQL_URL = "https://hackerone.com/graphql"
 ISSUES_URL = "https://github.com/sonnycroco/h1grep/issues"
@@ -93,15 +92,6 @@ query TeamLookup($handle: String!) {
 
 def _escape(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"')
-
-
-def _gql_list(items: list) -> str:
-    return "[" + ", ".join(f'"{_escape(str(i))}"' for i in items) + "]"
-
-
-def _offset_cursor(n: int) -> str:
-    """H1 uses base64(str(n)) as cursor offsets."""
-    return base64.b64encode(str(n).encode()).decode()
 
 
 def die_shape_changed(context: str = "") -> NoReturn:
@@ -148,7 +138,7 @@ def gql_vars(query: str, variables: dict) -> dict:
     return _post({"query": query, "variables": variables})
 
 
-def lookup_program(handle: str) -> Optional[str]:
+def lookup_program(handle: str) -> Optional[int]:
     data = gql_vars(TEAM_LOOKUP_QUERY, {"handle": handle})
     team = (data.get("data") or {}).get("team")
     if not team:
@@ -157,6 +147,12 @@ def lookup_program(handle: str) -> Optional[str]:
     team_id = team.get("_id")
     if team_id is None:
         die_shape_changed("team lookup")
+    try:
+        team_id = int(team_id)
+    except (TypeError, ValueError):
+        # The search index types team_id as [Int!]; a non-numeric id means the
+        # team schema changed shape.
+        die_shape_changed(f"team lookup: non-numeric team id {team_id!r}")
     print(f"[+] {team.get('handle', handle)} → id={team_id}, name={team.get('name', '?')}")
     return team_id
 
@@ -173,6 +169,9 @@ def build_page_query(args, after: Optional[str] = None) -> str:
     Strategy:
     - Pure sort (no --program): no substate filter, sort works fine
     - Program filter: substate filter, no sort, client-side sort
+
+    Note: team_id is typed [Int!] server-side and must be emitted unquoted;
+    a quoted id is rejected with an argument-type error.
     """
     has_sort = args.top_voted or args.top_bounty
     has_program = bool(args.program_id)
@@ -191,7 +190,7 @@ def build_page_query(args, after: Optional[str] = None) -> str:
         # Filter mode: substate + optional team filter, no sort
         filter_parts = ['terms: {substate: ["resolved"]}']
         if has_program:
-            filter_parts.append(f'terms: {{team_id: ["{_escape(str(args.program_id))}"]}}')
+            filter_parts.append(f"terms: {{team_id: [{int(args.program_id)}]}}")
         filter_str = ", ".join(f"{{{p}}}" for p in filter_parts)
         return (
             f'{{ search(index: CompleteHacktivityReportIndex, '
@@ -201,10 +200,16 @@ def build_page_query(args, after: Optional[str] = None) -> str:
         )
 
 
-def fetch_all_pages(args) -> list[dict]:
-    """Fetch up to args.pages pages from the H1 GraphQL API."""
+def fetch_all_pages(args) -> tuple[list[dict], bool]:
+    """Fetch up to args.pages pages from the H1 GraphQL API.
+
+    Returns (nodes, had_error). A GraphQL error stops paging but keeps whatever
+    earlier pages returned; the flag lets the caller exit non-zero so a broken
+    query is never mistaken for an empty result set.
+    """
     all_nodes: list[dict] = []
     cursor = None
+    had_error = False
 
     for page_num in range(1, args.pages + 1):
         if page_num > 1:
@@ -216,6 +221,7 @@ def fetch_all_pages(args) -> list[dict]:
         if "errors" in data or data.get("data") is None:
             for err in (data.get("errors") or []):
                 print(f"[!] GraphQL error (page {page_num}): {err.get('message')}", file=sys.stderr)
+            had_error = True
             break
 
         search = data["data"].get("search") if isinstance(data.get("data"), dict) else None
@@ -236,7 +242,7 @@ def fetch_all_pages(args) -> list[dict]:
             if matching >= args.limit:
                 break
 
-    return all_nodes
+    return all_nodes, had_error
 
 
 def apply_client_filters(nodes: list[dict], args) -> list[dict]:
@@ -297,9 +303,20 @@ def format_severity(s: Optional[str]) -> str:
     return f"{c}{s.upper()}{reset}"
 
 
-def print_results(results: list[dict], total_fetched: int, args):
+def _undisclosed_note(undisclosed: int, total_fetched: int) -> str:
+    """Explain rows dropped for having no public report body. These dominate
+    bounty-sorted pages, where most high-payout entries are still undisclosed."""
+    return (
+        f" {undisclosed} of {total_fetched} fetched are undisclosed "
+        f"(bounty data only, no public report) — widen --pages for more"
+    )
+
+
+def print_results(results: list[dict], total_fetched: int, args, undisclosed: int = 0):
     if not results:
         print("[*] No matching results found.")
+        if undisclosed:
+            print(f"   {_undisclosed_note(undisclosed, total_fetched).strip()}")
         return
 
     print(f"\n{'='*72}")
@@ -316,7 +333,18 @@ def print_results(results: list[dict], total_fetched: int, args):
         label_parts.append(f"program={args.program}")
     label = " | ".join(label_parts) if label_parts else "all disclosed"
     print(f" h1grep — {label}")
-    print(f" {len(results)} matches from {total_fetched} fetched reports")
+
+    total_matches = len(results)
+    shown = min(total_matches, args.limit)
+    if shown < total_matches:
+        print(
+            f" showing {shown} of {total_matches} matches from "
+            f"{total_fetched} fetched reports — raise with --limit/-n"
+        )
+    else:
+        print(f" {total_matches} matches from {total_fetched} fetched reports")
+    if undisclosed:
+        print(_undisclosed_note(undisclosed, total_fetched))
     print(f"{'='*72}\n")
 
     for i, node in enumerate(results[: args.limit], 1):
@@ -384,23 +412,28 @@ def main():
     args = parser.parse_args()
 
     if args.lookup_program:
-        lookup_program(args.lookup_program)
+        if lookup_program(args.lookup_program) is None:
+            sys.exit(1)
         return
 
     args.program_id = None
     if args.program:
         args.program_id = lookup_program(args.program)
-        if not args.program_id:
+        if args.program_id is None:
             sys.exit(1)
 
-    nodes = fetch_all_pages(args)
+    nodes, had_error = fetch_all_pages(args)
     results = apply_client_filters(nodes, args)
     results = client_sort(results, args)
+    undisclosed = sum(1 for n in nodes if not n.get("report"))
 
     if args.json:
         print(json.dumps(results[: args.limit], indent=2))
     else:
-        print_results(results, len(nodes), args)
+        print_results(results, len(nodes), args, undisclosed)
+
+    if had_error:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
