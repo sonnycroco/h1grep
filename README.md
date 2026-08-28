@@ -1,4 +1,4 @@
-# h1grep
+# h1grep [![PyPI Downloads](https://static.pepy.tech/personalized-badge/h1grep?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads)](https://pepy.tech/projects/h1grep)
 
 **grep for disclosed HackerOne reports.** A zero-dependency CLI that searches
 HackerOne's public [Hacktivity](https://hackerone.com/hacktivity) feed of
