@@ -1,42 +1,17 @@
 # h1grep [![PyPI Downloads](https://static.pepy.tech/personalized-badge/h1grep?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads)](https://pepy.tech/projects/h1grep)
 
-**grep for disclosed HackerOne reports.** A zero-dependency CLI that searches
-HackerOne's public [Hacktivity](https://hackerone.com/hacktivity) feed of
-*disclosed, resolved* vulnerability reports — by keyword, severity, CWE, program,
-top votes, or top bounty — and prints structured results for recon and research.
+Search HackerOne's disclosed reports from your terminal.
 
-No API key. No account. Read-only. Standard-library Python only.
+h1grep queries the public [Hacktivity](https://hackerone.com/hacktivity) feed
+and lets you filter it by keyword, severity, CWE and program, or sort it by
+votes or bounty. It's handy for checking what has already been reported
+against a program, and for reading the reports that paid well or that other
+hunters rated highly.
 
-```
-$ h1grep --top-voted --limit 3
+You don't need an API key or an account. It only reads public data, and it's
+a single Python file with no dependencies.
 
-========================================================================
- h1grep — top voted
- showing 3 of 50 matches from 50 fetched reports — raise with --limit/-n
-========================================================================
-
-[01] Takeover an account that doesn't have a Shopify ID and more
-     Severity : CRITICAL  |  CWE: n/a
-     Program  : shopify  |  Reporter: imgnotfound
-     Bounty   : no bounty  |  Votes: 2993
-     URL      : https://hackerone.com/reports/867513
-```
-
-## Why
-
-It isn't "another recon script." The value is the **reverse-engineered GraphQL
-knowledge** baked in. HackerOne's Hacktivity endpoint is public but undocumented,
-and it moves. For a long stretch it hard-crashed on several otherwise-natural
-query shapes (substate filter + sort + report fields; `disclosed_at` + substate;
-named variables + substate + report fields), so `h1grep` encodes empirical
-crash-avoidance rules. More recently it tightened `team_id` to a strict `[Int!]`,
-which silently breaks any client still quoting the value. Tracking that drift is
-the work — it's why searching disclosed reports from the terminal *just works*
-here.
-
-Studying disclosed reports is one of the highest-signal ways to learn validated
-techniques: what got voted up by the community, what paid out, and how impact was
-framed for a specific program.
+![h1grep --top-voted --limit 3](https://raw.githubusercontent.com/sonnycroco/h1grep/main/assets/top-voted.png)
 
 ## Install
 
@@ -44,7 +19,7 @@ framed for a specific program.
 pip install h1grep
 ```
 
-Or run straight from source (nothing to install — it's stdlib-only):
+Or run it from a clone. There's nothing to install:
 
 ```bash
 git clone https://github.com/sonnycroco/h1grep
@@ -52,90 +27,106 @@ cd h1grep
 python3 h1grep.py --top-voted --limit 25
 ```
 
-Requires **Python 3.9+**.
+Needs Python 3.9 or newer.
 
-## Usage
+## Examples
+
+### Find reports on a bug class
+
+Keyword, severity and CWE filters run on your machine after the results are
+downloaded, so fetch a few pages when you filter. Here are the top-voted
+critical and high SSRF reports from the first 250 results:
 
 ```bash
-# Top-voted reports — best validated techniques, great starting point
-h1grep --top-voted --limit 25
-
-# Highest-bounty reports — signal for business-impact framing
-h1grep --top-bounty --limit 10
-
-# Keyword search in report titles across multiple pages
-h1grep --query "SSRF" --pages 10
-h1grep --query "OAuth bypass" --pages 5
-
-# Filter by severity (client-side)
-h1grep --top-voted --severity critical high --limit 20
-
-# Filter by CWE label (client-side regex)
-h1grep --top-voted --cwe "SSRF" "Request Forgery"
-
-# Program-specific disclosures
-h1grep --program shopify --pages 3
-
-# Resolve a program handle to its numeric team ID
-h1grep --lookup-program gitlab
-
-# Full combo: top-bounty SSRF reports, critical/high only
-h1grep --top-bounty --query "SSRF" --severity critical high --pages 10
-
-# JSON output for piping into jq, etc.
-h1grep --top-voted --query "XSS" --pages 5 --json
+h1grep --top-voted --query "SSRF" --severity critical high --pages 5
 ```
 
-### Options
+![SSRF search](https://raw.githubusercontent.com/sonnycroco/h1grep/main/assets/ssrf-critical-high.png)
 
-| Flag | Description |
-|------|-------------|
-| `--query`, `-q` | Keyword regex matched against report titles (client-side) |
-| `--severity`, `-s` | Filter by severity: `none low medium high critical` (client-side) |
-| `--cwe` | Filter by CWE label regex, e.g. `"SSRF" "Traversal"` (client-side) |
-| `--program`, `-p` | Filter by program handle (e.g. `shopify`) |
-| `--lookup-program` | Resolve a program handle to its numeric team ID and exit |
-| `--top-voted` | Sort by community votes (validated techniques) |
-| `--top-bounty` | Sort by bounty amount (impact framing) |
-| `--limit`, `-n` | Max results to display (default: 20) |
-| `--pages` | Pages to fetch, 50 results/page (default: 1; use 5–20 for keyword searches) |
-| `--json` | Emit raw JSON instead of formatted text |
+`--query` and `--cwe` take regular expressions, so `--query "OAuth|SAML"`
+works.
 
-Keyword, severity, and CWE filtering are applied **client-side** after fetching,
-so widen `--pages` when you filter aggressively.
+### Look at one program
 
-## How it works
+Use `--program` before you start on a target, to see what has already been
+found and paid for there. Handles aren't case-sensitive.
 
-1. **Query building** — inline GraphQL strings are assembled per mode to route
-   around the endpoint's crash triggers. Pure sort (no program) uses server-side
-   sorting; program filtering uses a substate/team filter with no server-side
-   sort, then sorts client-side.
-2. **Pagination** — walks pages of 50, following the server-supplied
-   `pageInfo.endCursor` and sleeping 0.3s between pages (polite rate limiting),
-   up to `--pages`.
-3. **Client-side filter & sort** — keyword/severity/CWE and the fallback sort
-   are applied locally.
-4. **Output** — color-coded text by default, or `--json`. The header reports how
-   many matches were shown versus found, and how many fetched rows were dropped
-   for being undisclosed.
+```bash
+h1grep --program gitlab --top-bounty --pages 4
+```
 
-## Caveats
+![GitLab reports by bounty](https://raw.githubusercontent.com/sonnycroco/h1grep/main/assets/program-gitlab.png)
 
-- **Undocumented endpoint.** `h1grep` uses the same public GraphQL endpoint the
-  Hacktivity web UI calls. It is not an official API and may change without
-  notice. When the response shape changes, `h1grep` fails with a clear
-  *"HackerOne API shape changed — please open an issue"* message rather than a
-  stack trace — please do [open an issue](https://github.com/sonnycroco/h1grep/issues)
-  if you hit it.
-- **Disclosed reports only.** It can only see what HackerOne has publicly
-  disclosed — never private program data.
-- **`--top-bounty` has a low yield per page.** The highest-paying entries are
-  mostly still undisclosed: they carry a bounty amount but no public report, so
-  they get dropped. Typically only ~5 of 50 fetched rows survive on the first
-  page. The header tells you how many were dropped — widen `--pages`.
-- **Read-only and rate-limited by design.** It fetches and prints; it does not
-  write, submit, or scrape aggressively. Please keep it that way and be a good
-  citizen of the endpoint.
+### Pipe it into other tools
+
+`--json` prints the raw results as a JSON array, so you can process them with
+`jq` or your own scripts:
+
+```bash
+h1grep --top-voted --query XSS --pages 5 -n 8 --json \
+  | jq -r '.[] | [.votes, .team.handle, .report.title] | @tsv'
+```
+
+![JSON piped into jq](https://raw.githubusercontent.com/sonnycroco/h1grep/main/assets/json-jq.png)
+
+### More
+
+```bash
+h1grep                                    # newest disclosures first
+h1grep --top-bounty --limit 10            # biggest payouts
+h1grep --top-voted --cwe "SSRF" "Request Forgery"
+h1grep --lookup-program gitlab            # handle -> numeric team ID
+```
+
+## Options
+
+| Flag | What it does |
+|------|--------------|
+| `-q`, `--query` | Regex matched against report titles |
+| `-s`, `--severity` | Keep only these severities: `none low medium high critical` |
+| `--cwe` | Regex(es) matched against the CWE name, e.g. `"SSRF" "Traversal"` |
+| `-p`, `--program` | Only reports from this program handle, e.g. `shopify` |
+| `--lookup-program` | Print a program's numeric team ID and exit |
+| `--top-voted` | Sort by community votes |
+| `--top-bounty` | Sort by bounty paid (can't be combined with `--top-voted`) |
+| `-n`, `--limit` | How many results to print (default 20) |
+| `--pages` | How many pages of 50 to fetch (default 1) |
+| `--json` | Print JSON instead of text |
+
+Without `--top-voted` or `--top-bounty` you get the newest disclosures first.
+
+Colour is only used when printing to a terminal. Set `NO_COLOR` to turn it
+off. Status messages go to stderr, so `--json` output is always valid JSON.
+
+Exit codes: `0` on success, including when nothing matched. `1` for a network
+or API error, or an unknown program. `2` for bad arguments or an unexpected
+API response. `130` if interrupted.
+
+## Things to know
+
+**This uses an undocumented API.** h1grep calls the same GraphQL endpoint the
+Hacktivity page uses. It's not an official API and HackerOne changes it
+without notice. It has already broken program filtering once, when the
+`team_id` field stopped being searchable. If the response stops looking the way
+h1grep expects, it says so and exits instead of printing garbage. If you see
+that, please [open an issue](https://github.com/sonnycroco/h1grep/issues).
+
+**`--top-bounty` needs more pages.** Most of the highest-paid reports were
+never made public. HackerOne still lists them with a bounty amount but no
+report, and h1grep drops them. Often only 2 to 5 of the first 50 results
+survive. The header tells you how many were dropped, so raise `--pages`.
+
+**Ties can be skipped deep in sorted results.** HackerOne pages by position
+and doesn't break ties. Far down a `--top-voted` or `--top-bounty` list, a
+report with the same vote count or bounty as its neighbours can fall between
+two pages. The order you see is still correct, and the top of the list isn't
+affected. Reports that show up on more than one page are only printed once.
+
+**It only sees public data.** Disclosed, resolved reports only. Nothing
+private.
+
+**Be gentle with it.** h1grep waits 0.3 seconds between pages and only reads.
+Please don't turn it into a scraper.
 
 ## License
 

@@ -15,7 +15,7 @@ Usage examples:
 
   # Keyword search in titles across multiple pages
   h1grep --query "SSRF" --pages 10
-  h1grep --query "OAuth bypass" --pages 5
+  h1grep --top-voted --query "OAuth|SAML" --pages 5
 
   # Filter by severity (client-side)
   h1grep --top-voted --severity critical high --limit 20
@@ -41,6 +41,7 @@ Usage examples:
 
 import argparse
 import json
+import os
 import sys
 import re
 import time
@@ -48,7 +49,7 @@ import urllib.request
 import urllib.error
 from typing import NoReturn, Optional
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 GRAPHQL_URL = "https://hackerone.com/graphql"
 ISSUES_URL = "https://github.com/sonnycroco/h1grep/issues"
@@ -94,6 +95,16 @@ def _escape(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _clean(value) -> str:
+    """Strip control characters from API text before it reaches the terminal.
+    Report titles are written by reporters, so an embedded escape sequence
+    could otherwise recolour, hide, or rewrite what the user sees."""
+    return _CONTROL_CHARS.sub("", str(value))
+
+
 def die_shape_changed(context: str = "") -> NoReturn:
     """The endpoint returned HTTP 200 but the JSON did not match the expected
     schema. This is the drift signal: HackerOne's undocumented API changed
@@ -117,7 +128,7 @@ def _post(body: dict) -> dict:
             raw = resp.read()
     except urllib.error.HTTPError as e:
         body_text = e.read().decode(errors="replace")
-        print(f"[!] HTTP {e.code}: {body_text[:300]}", file=sys.stderr)
+        print(f"[!] HTTP {e.code}: {_clean(body_text[:300])}", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
         print(f"[!] Request failed: {e}", file=sys.stderr)
@@ -138,9 +149,19 @@ def gql_vars(query: str, variables: dict) -> dict:
     return _post({"query": query, "variables": variables})
 
 
-def lookup_program(handle: str) -> Optional[int]:
+def lookup_program(handle: str, status_to_stderr: bool = False) -> Optional[str]:
+    """Resolve a program handle, print its numeric id, and return the canonical
+    handle (None if the program does not exist or is private).
+
+    The id line is the output of --lookup-program but only a status message
+    for --program, where it goes to stderr so --json stays parseable."""
     data = gql_vars(TEAM_LOOKUP_QUERY, {"handle": handle})
     team = (data.get("data") or {}).get("team")
+    if not team and handle != handle.lower():
+        # The lookup is case-sensitive and handles are lowercase, so retry
+        # rather than reject "GitLab".
+        data = gql_vars(TEAM_LOOKUP_QUERY, {"handle": handle.lower()})
+        team = (data.get("data") or {}).get("team")
     if not team:
         print(f"[!] Program '{handle}' not found or is private", file=sys.stderr)
         return None
@@ -150,54 +171,65 @@ def lookup_program(handle: str) -> Optional[int]:
     try:
         team_id = int(team_id)
     except (TypeError, ValueError):
-        # The search index types team_id as [Int!]; a non-numeric id means the
-        # team schema changed shape.
+        # Team ids have always been numeric; anything else means the team
+        # schema changed shape.
         die_shape_changed(f"team lookup: non-numeric team id {team_id!r}")
-    print(f"[+] {team.get('handle', handle)} → id={team_id}, name={team.get('name', '?')}")
-    return team_id
+    canonical = team.get("handle") or handle
+    print(
+        f"[+] {_clean(canonical)} → id={team_id}, name={_clean(team.get('name', '?'))}",
+        file=sys.stderr if status_to_stderr else sys.stdout,
+    )
+    return canonical
 
 
 def build_page_query(args, after: Optional[str] = None) -> str:
     """
     Build an inline GraphQL query for one page of results.
 
-    H1 crash rules (discovered empirically):
+    Historical H1 crash rules (discovered empirically; none reproduce as of
+    2026-07-31, and every mode now combines the substate filter with a sort):
     - substate filter + sort + report fields  → CRASH
     - disclosed_at field + substate filter    → CRASH
     - named variables + substate filter + report fields → CRASH
 
-    Strategy:
-    - Pure sort (no --program): no substate filter, sort works fine
-    - Program filter: substate filter, no sort, client-side sort
+    Program filtering goes through query_string on team_handle. The
+    structured team_id filter was tightened to [Int!] and then made
+    unsearchable outright (2026-10). The handle must be quoted: an unquoted
+    hyphenated handle is tokenized and matches other programs too
+    (nodejs-ecosystem also pulls in nodejs).
 
-    Note: team_id is typed [Int!] server-side and must be emitted unquoted;
-    a quoted id is rejected with an argument-type error.
+    A sort is always sent. Cursors are plain offsets with no tiebreaker, and
+    without a sort the order shifts between requests, so pages overlap and
+    reports get skipped (a full shopify walk: 613 rows, ~520-550 unique).
+    disclosed_at DESC (newest first) pages stably.
     """
     has_sort = args.top_voted or args.top_bounty
-    has_program = bool(args.program_id)
+    has_program = bool(args.program_handle)
 
     after_str = f', after: "{_escape(after)}"' if after else ""
+    if args.top_voted:
+        sort_field = "votes"
+    elif args.top_bounty:
+        sort_field = "total_awarded_amount"
+    else:
+        sort_field = "disclosed_at"
+    sort_str = f', sort: {{field: "{sort_field}", direction: DESC}}'
 
     if has_sort and not has_program:
-        # Sort-only mode: no substate filter, works without crashing
-        sort_field = "votes" if args.top_voted else "total_awarded_amount"
-        return (
-            f'{{ search(index: CompleteHacktivityReportIndex, query: {{bool: {{}}}}, '
-            f'first: {PAGE_SIZE}{after_str}, sort: {{field: "{sort_field}", direction: DESC}}) '
-            f'{{ total_count pageInfo {{ endCursor }} nodes {{ {REPORT_FIELDS} }} }} }}'
-        )
+        # Sort-only mode: no substate filter
+        query_str = "query: {bool: {}}"
     else:
-        # Filter mode: substate + optional team filter, no sort
-        filter_parts = ['terms: {substate: ["resolved"]}']
-        if has_program:
-            filter_parts.append(f"terms: {{team_id: [{int(args.program_id)}]}}")
-        filter_str = ", ".join(f"{{{p}}}" for p in filter_parts)
-        return (
-            f'{{ search(index: CompleteHacktivityReportIndex, '
-            f'query: {{bool: {{filter: [{filter_str}]}}}}, '
-            f'first: {PAGE_SIZE}{after_str}) '
-            f'{{ total_count pageInfo {{ endCursor }} nodes {{ {REPORT_FIELDS} }} }} }}'
-        )
+        query_str = 'query: {bool: {filter: [{terms: {substate: ["resolved"]}}]}}'
+
+    if has_program:
+        qs = f'team_handle:"{_escape(args.program_handle)}" AND disclosed:true'
+        query_str += f', query_string: "{_escape(qs)}"'
+
+    return (
+        f'{{ search(index: CompleteHacktivityReportIndex, {query_str}, '
+        f'first: {PAGE_SIZE}{after_str}{sort_str}) '
+        f'{{ total_count pageInfo {{ endCursor }} nodes {{ {REPORT_FIELDS} }} }} }}'
+    )
 
 
 def fetch_all_pages(args) -> tuple[list[dict], bool]:
@@ -206,8 +238,13 @@ def fetch_all_pages(args) -> tuple[list[dict], bool]:
     Returns (nodes, had_error). A GraphQL error stops paging but keeps whatever
     earlier pages returned; the flag lets the caller exit non-zero so a broken
     query is never mistaken for an empty result set.
+
+    Nodes already seen on an earlier page are dropped: offset paging over
+    rows tied on the sort value (equal bounties, equal votes) can return the
+    same report twice.
     """
     all_nodes: list[dict] = []
+    seen: set = set()
     cursor = None
     had_error = False
 
@@ -220,7 +257,7 @@ def fetch_all_pages(args) -> tuple[list[dict], bool]:
 
         if "errors" in data or data.get("data") is None:
             for err in (data.get("errors") or []):
-                print(f"[!] GraphQL error (page {page_num}): {err.get('message')}", file=sys.stderr)
+                print(f"[!] GraphQL error (page {page_num}): {_clean(err.get('message'))}", file=sys.stderr)
             had_error = True
             break
 
@@ -228,10 +265,17 @@ def fetch_all_pages(args) -> tuple[list[dict], bool]:
         if not isinstance(search, dict):
             die_shape_changed(f"page {page_num}: missing 'search'")
         nodes = search.get("nodes", [])
-        if not isinstance(nodes, list):
-            die_shape_changed(f"page {page_num}: 'nodes' not a list")
-        all_nodes.extend(nodes)
-        cursor = (search.get("pageInfo") or {}).get("endCursor")
+        if not isinstance(nodes, list) or not all(isinstance(n, dict) for n in nodes):
+            die_shape_changed(f"page {page_num}: 'nodes' not a list of objects")
+        for n in nodes:
+            key = n.get("id") or (n.get("report") or {}).get("_id")
+            if key is not None:
+                if key in seen:
+                    continue
+                seen.add(key)
+            all_nodes.append(n)
+        page_info = search.get("pageInfo")
+        cursor = page_info.get("endCursor") if isinstance(page_info, dict) else None
 
         if not nodes or not cursor:
             break
@@ -276,21 +320,17 @@ def apply_client_filters(nodes: list[dict], args) -> list[dict]:
     return results
 
 
-def client_sort(results: list[dict], args) -> list[dict]:
-    """Apply client-side sort when server-side sort was skipped (filter mode)."""
-    has_sort = args.top_voted or args.top_bounty
-    has_program = bool(args.program_id)
-
-    if has_sort and has_program:
-        key = "votes" if args.top_voted else "total_awarded_amount"
-        results = sorted(results, key=lambda n: n.get(key) or 0, reverse=True)
-
-    return results
+def _use_color() -> bool:
+    """Colour only on a terminal, and never when NO_COLOR is set (no-color.org)."""
+    return sys.stdout.isatty() and not os.environ.get("NO_COLOR")
 
 
 def format_severity(s: Optional[str]) -> str:
     if not s:
         return "none"
+    s = _clean(s)
+    if not _use_color():
+        return s.upper()
     colors = {
         "critical": "\033[91m",
         "high": "\033[33m",
@@ -330,19 +370,20 @@ def print_results(results: list[dict], total_fetched: int, args, undisclosed: in
     if args.severity:
         label_parts.append(f"severity={','.join(args.severity)}")
     if args.program:
-        label_parts.append(f"program={args.program}")
+        label_parts.append(f"program={_clean(args.program_handle or args.program)}")
     label = " | ".join(label_parts) if label_parts else "all disclosed"
     print(f" h1grep — {label}")
 
     total_matches = len(results)
     shown = min(total_matches, args.limit)
+    matches = "match" if total_matches == 1 else "matches"
     if shown < total_matches:
         print(
-            f" showing {shown} of {total_matches} matches from "
+            f" showing {shown} of {total_matches} {matches} from "
             f"{total_fetched} fetched reports — raise with --limit/-n"
         )
     else:
-        print(f" {total_matches} matches from {total_fetched} fetched reports")
+        print(f" {total_matches} {matches} from {total_fetched} fetched reports")
     if undisclosed:
         print(_undisclosed_note(undisclosed, total_fetched))
     print(f"{'='*72}\n")
@@ -352,18 +393,19 @@ def print_results(results: list[dict], total_fetched: int, args, undisclosed: in
         team = node.get("team", {}) or {}
         reporter = node.get("reporter", {}) or {}
 
-        title = report.get("title", "Unknown")
-        url = report.get("url", "")
+        title = _clean(report.get("title", "Unknown"))
+        url = _clean(report.get("url", ""))
         severity = format_severity(node.get("severity_rating"))
-        cwe = node.get("cwe") or ""
-        cves = ", ".join(node.get("cve_ids") or [])
+        cwe = _clean(node.get("cwe") or "")
+        cves = _clean(", ".join(map(str, node.get("cve_ids") or [])))
         bounty = node.get("total_awarded_amount")
-        currency = node.get("currency") or "USD"
-        votes = node.get("votes") or 0
-        program = team.get("handle", "?")
-        reporter_name = reporter.get("username", "?")
+        currency = _clean(node.get("currency") or "USD")
+        votes = _clean(node.get("votes") or 0)
+        program = _clean(team.get("handle", "?"))
+        reporter_name = _clean(reporter.get("username", "?"))
 
-        bounty_str = f"${bounty:,} {currency}" if bounty else "no bounty"
+        bounty_str = (f"${bounty:,} {currency}" if isinstance(bounty, (int, float)) and bounty
+                      else "no bounty")
 
         print(f"[{i:02d}] {title}")
         print(f"     Severity : {severity}  |  CWE: {cwe or 'n/a'}")
@@ -375,7 +417,38 @@ def print_results(results: list[dict], total_fetched: int, args, undisclosed: in
         print()
 
 
+def _positive_int(value: str) -> int:
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {value!r}")
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, got {n}")
+    return n
+
+
 def main():
+    """Console entry point: exit quietly on Ctrl-C or a closed pipe
+    (`h1grep ... | head`) instead of dumping a traceback."""
+    try:
+        _main()
+        sys.stdout.flush()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        # Point stdout at devnull so the interpreter's final flush can't raise again.
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        sys.exit(1)
+
+
+def _main():
+    # Report titles are arbitrary Unicode; never crash on a terminal or
+    # redirect whose encoding can't represent them.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")
+
     parser = argparse.ArgumentParser(
         description="h1grep — grep disclosed HackerOne reports for recon and research",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -398,12 +471,13 @@ def main():
     )
     parser.add_argument("--program", "-p", metavar="HANDLE", help="Filter by program handle")
     parser.add_argument("--lookup-program", metavar="HANDLE", help="Resolve a program handle to its numeric ID and exit")
-    parser.add_argument("--top-voted", action="store_true", help="Sort by community votes (validated techniques)")
-    parser.add_argument("--top-bounty", action="store_true", help="Sort by bounty amount (impact framing reference)")
-    parser.add_argument("--limit", "-n", type=int, default=20, help="Max results to display (default: 20)")
+    sort_group = parser.add_mutually_exclusive_group()
+    sort_group.add_argument("--top-voted", action="store_true", help="Sort by community votes (validated techniques)")
+    sort_group.add_argument("--top-bounty", action="store_true", help="Sort by bounty amount (impact framing reference)")
+    parser.add_argument("--limit", "-n", type=_positive_int, default=20, help="Max results to display (default: 20)")
     parser.add_argument(
         "--pages",
-        type=int,
+        type=_positive_int,
         default=1,
         help="Number of pages to fetch (50 results/page, default: 1). Use 5-20 for keyword searches.",
     )
@@ -411,20 +485,31 @@ def main():
 
     args = parser.parse_args()
 
+    for flag, value in (("--program", args.program), ("--lookup-program", args.lookup_program)):
+        if value is not None and not value.strip():
+            parser.error(f"argument {flag}: handle must not be empty")
+
+    # Validate regexes before spending any requests.
+    for flag, patterns in (("--query", [args.query] if args.query else []), ("--cwe", args.cwe or [])):
+        for pattern in patterns:
+            try:
+                re.compile(pattern)
+            except re.error as e:
+                parser.error(f"argument {flag}: invalid regex {pattern!r}: {e}")
+
     if args.lookup_program:
-        if lookup_program(args.lookup_program) is None:
+        if lookup_program(args.lookup_program.strip()) is None:
             sys.exit(1)
         return
 
-    args.program_id = None
+    args.program_handle = None
     if args.program:
-        args.program_id = lookup_program(args.program)
-        if args.program_id is None:
+        args.program_handle = lookup_program(args.program.strip(), status_to_stderr=True)
+        if args.program_handle is None:
             sys.exit(1)
 
     nodes, had_error = fetch_all_pages(args)
     results = apply_client_filters(nodes, args)
-    results = client_sort(results, args)
     undisclosed = sum(1 for n in nodes if not n.get("report"))
 
     if args.json:
